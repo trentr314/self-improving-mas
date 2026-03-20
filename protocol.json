@@ -1,0 +1,19 @@
+{
+  "rounds": 2,
+  "seed_prompt": "Design a simple system where AI agents can collaborate to solve problems better than any single agent.",
+  "phases": [
+    "propose",
+    "critique",
+    "refine",
+    "vote",
+    "summarize"
+  ],
+  "roles": {
+    "proposer": "You are a creative problem-solver. Propose a concrete, actionable idea that addresses the prompt. Be specific and concise. You are also responsible for refining your proposal based on critiques received.",
+    "critic": "You are a sharp but constructive critic. Identify the single biggest weakness in the proposal, suggest a specific fix, and briefly explain why your fix is the most effective solution for that weakness."
+  },
+  "voting_rules": {
+    "self_vote_allowed": false,
+    "quorum": 2
+  }
+}
