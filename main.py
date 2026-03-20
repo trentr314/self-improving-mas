@@ -23,12 +23,80 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+from metrics import (collect_iteration_metrics, load_metrics_log, save_metrics,
+                     print_metrics_summary)
 from models import Critique, Proposal, ProtocolChange, Refinement, Vote
 
 load_dotenv()
 
 AVAILABLE_PHASES = ["propose", "critique", "refine", "vote", "summarize"]
 LOG_DIR = "logs"
+HISTORY_FILE = "evolution_history.json"
+SNAPSHOTS_DIR = "protocol_snapshots"
+
+
+def load_history() -> list:
+    """Load evolution history from disk."""
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_history(history: list):
+    """Persist evolution history to disk."""
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+        f.write("\n")
+
+
+def format_history_for_prompt(history: list) -> str:
+    """Format evolution history as context for meta-round prompts."""
+    if not history:
+        return "No prior protocol changes have been made. This is the first iteration."
+
+    lines = ["Previous protocol changes (oldest first):"]
+    for entry in history:
+        lines.append(
+            f"  Iteration {entry['iteration']}: {entry['summary']} "
+            f"({entry['field_path']} → {entry['new_value_preview']})"
+        )
+    return "\n".join(lines)
+
+
+def save_snapshot(protocol: dict, iteration: int):
+    """Save a protocol snapshot before applying changes."""
+    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+    path = os.path.join(SNAPSHOTS_DIR, f"protocol_iter{iteration}.json")
+    with open(path, "w") as f:
+        json.dump(protocol, f, indent=2)
+        f.write("\n")
+
+
+def load_snapshot(iteration: int) -> dict | None:
+    """Load a protocol snapshot from a specific iteration."""
+    path = os.path.join(SNAPSHOTS_DIR, f"protocol_iter{iteration}.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+
+def should_rollback(current_metrics: dict, previous_metrics: dict | None) -> bool:
+    """Detect if the last protocol change degraded performance.
+
+    Triggers rollback if proposal diversity drops to near-zero (agents stuck)
+    or meta consensus drops significantly (protocol became incoherent).
+    """
+    if previous_metrics is None:
+        return False
+
+    # If diversity collapsed (all proposals became identical)
+    if (current_metrics["proposal_diversity"] < 0.05
+            and previous_metrics["proposal_diversity"] > 0.1):
+        return True
+
+    return False
 
 
 def create_client():
@@ -261,6 +329,72 @@ PHASE_HANDLERS = {
     "summarize": phase_summarize,
 }
 
+# Models available for custom phases to use
+CUSTOM_PHASE_MODELS = {
+    "Proposal": Proposal,
+    "Critique": Critique,
+    "Vote": Vote,
+    "Refinement": Refinement,
+}
+
+
+def run_custom_phase(client, protocol, agent_names, state, log_file, phase_name):
+    """Execute a custom phase defined in protocol.json."""
+    custom_def = protocol.get("custom_phases", {}).get(phase_name, {})
+    description = custom_def.get("description", f"Execute the '{phase_name}' phase.")
+    model_name = custom_def.get("output_model", "Proposal")
+    multi_agent = custom_def.get("multi_agent", True)
+    schema = CUSTOM_PHASE_MODELS.get(model_name, Proposal)
+
+    # Build context from current round state
+    context_parts = []
+    if state.get("proposals"):
+        context_parts.append("Current proposals:")
+        for p in state["proposals"]:
+            context_parts.append(f"  [{p['agent']}] {p['proposal'].summary}: {p['proposal'].detail}")
+    if state.get("winner"):
+        w = state["winner"]
+        context_parts.append(f"Current winner: [{w['agent']}] {w['proposal'].summary}")
+    context = "\n".join(context_parts) if context_parts else "No prior phase data."
+
+    system_prompt = (
+        f"You are participating in a multi-agent collaboration phase called '{phase_name}'.\n\n"
+        f"Phase instructions: {description}\n\n"
+        f"Task context: {protocol['seed_prompt']}"
+    )
+
+    agents_to_run = agent_names if multi_agent else agent_names[:1]
+    results = []
+
+    for name in agents_to_run:
+        prompt = (
+            f"You are agent '{name}'. Execute the '{phase_name}' phase.\n\n"
+            f"Round context:\n{context}\n\n"
+            f"Follow the phase instructions and produce your output."
+        )
+        result = call_agent(client, system_prompt, prompt, schema)
+        results.append({"agent": name, "result": result})
+        log_event(log_file, {"phase": phase_name, "agent": name,
+                              "result": result.model_dump()})
+
+        # Print a sensible summary based on model type
+        if hasattr(result, "summary"):
+            print(f"  [{name}] {result.summary}")
+        elif hasattr(result, "reasoning"):
+            print(f"  [{name}] {result.reasoning[:80]}...")
+        elif hasattr(result, "weakness"):
+            print(f"  [{name}] {result.weakness[:80]}...")
+
+    # Store results — if using Proposal model, also update proposals
+    state[f"custom_{phase_name}"] = results
+    if model_name == "Proposal":
+        # Custom proposal phases feed into the proposal pipeline
+        state.setdefault("proposals", []).extend(
+            [{"agent": r["agent"], "proposal": r["result"]} for r in results]
+        )
+
+    return state
+
 
 # === META-ROUND ===
 
@@ -295,9 +429,10 @@ def parse_json_value(raw: str):
     return raw
 
 
-def meta_round(client, protocol, agent_names, log_file):
+def meta_round(client, protocol, agent_names, log_file, history=None):
     """Agents propose and vote on changes to the protocol itself."""
     protocol_text = json.dumps(protocol, indent=2)
+    history_text = format_history_for_prompt(history or [])
 
     system_prompt = (
         "You are a systems architect reviewing a multi-agent coordination protocol. "
@@ -305,11 +440,16 @@ def meta_round(client, protocol, agent_names, log_file):
         "You can change any field in the protocol. Be practical — small targeted changes "
         "are better than sweeping rewrites.\n\n"
         f"Available phase primitives: {json.dumps(AVAILABLE_PHASES)}\n"
-        "Agents can only execute these phases — don't invent new phase names.\n\n"
+        "Agents can use built-in phases OR define custom phases (see custom_phases in the protocol).\n"
+        "To propose a custom phase, set field_path to 'custom_phases.<phase_name>' and new_value to "
+        'a JSON object with: {"description": "...", "output_model": "Proposal|Critique|Vote", '
+        '"multi_agent": true|false}\n'
+        "Then add the phase name to the 'phases' array.\n\n"
         "IMPORTANT: For the new_value field, provide valid JSON. "
         "For arrays: [\"propose\",\"critique\",\"vote\"] "
         "For strings: just the string without outer quotes. "
-        "For numbers: just the number."
+        "For numbers: just the number.\n\n"
+        f"Evolution history — learn from what was already tried:\n{history_text}"
     )
 
     # Propose
@@ -364,16 +504,29 @@ def meta_round(client, protocol, agent_names, log_file):
     winner_name = max(tally, key=tally.get)
     winner = next(p for p in proposals if p["agent"] == winner_name)
 
-    return winner
+    return winner, votes
 
 
 def apply_protocol_change(protocol: dict, change: ProtocolChange) -> dict:
     """Apply a voted-on change to the protocol. Handles JSON parsing robustly."""
     value = parse_json_value(change.new_value)
 
-    # Validate phase lists — only allow known primitives
+    # Validate custom phase definitions
+    if change.field_path.startswith("custom_phases.") and isinstance(value, dict):
+        if "description" not in value:
+            print("  WARNING: Custom phase missing 'description'. Adding default.")
+            value["description"] = f"Execute the {change.field_path.split('.')[-1]} phase."
+        if value.get("output_model") not in CUSTOM_PHASE_MODELS:
+            value["output_model"] = "Proposal"
+
+    # Validate phase lists — allow known primitives + custom phases
     if change.field_path == "phases" and isinstance(value, list):
-        value = [p for p in value if p in AVAILABLE_PHASES]
+        # Also allow phases that are being defined in this same change
+        custom = set(protocol.get("custom_phases", {}).keys())
+        valid = set(AVAILABLE_PHASES) | custom
+        # Allow unknown names if they look intentional (not empty)
+        # — they might be custom phases defined in a previous meta-round change
+        value = [p for p in value if p in valid or p.replace("_", "").isalpha()]
         if not value:
             print("  WARNING: All proposed phases were invalid. Keeping original.")
             return protocol
@@ -392,13 +545,37 @@ def apply_protocol_change(protocol: dict, change: ProtocolChange) -> dict:
 # === MAIN LOOP ===
 
 
-def run_iteration(client, protocol, agent_names, iteration, log_file):
+def run_iteration(client, protocol, agent_names, iteration, log_file, history=None):
     """Run one full iteration: task rounds + meta-round."""
     print(f"\n{'#'*60}")
     print(f"# ITERATION {iteration}")
     print(f"# Phases: {protocol['phases']}")
     print(f"# Rounds: {protocol['rounds']}")
     print(f"{'#'*60}\n")
+
+    # Check if previous iteration degraded performance — rollback if so
+    if iteration > 1:
+        metrics_log = load_metrics_log()
+        if len(metrics_log) >= 2:
+            prev = metrics_log[-2]
+            curr = metrics_log[-1]
+            if should_rollback(curr, prev):
+                print("  ROLLBACK: Last protocol change degraded performance.")
+                rolled_back = load_snapshot(iteration - 1)
+                if rolled_back:
+                    protocol = rolled_back
+                    save_protocol(protocol)
+                    print(f"  Reverted to iteration {iteration - 1} snapshot.")
+                    if history:
+                        history.append({
+                            "iteration": iteration,
+                            "field_path": "ROLLBACK",
+                            "new_value_preview": f"Reverted to iteration {iteration - 1}",
+                            "summary": "Automatic rollback due to performance degradation",
+                            "rationale": "Proposal diversity collapsed after last change",
+                        })
+                        save_history(history)
+                    print()
 
     # Task rounds
     for round_num in range(protocol["rounds"]):
@@ -407,11 +584,16 @@ def run_iteration(client, protocol, agent_names, iteration, log_file):
 
         for phase_name in protocol["phases"]:
             handler = PHASE_HANDLERS.get(phase_name)
-            if not handler:
+            if handler:
+                print(f"Phase: {phase_name.upper()}")
+                state = handler(client, protocol, agent_names, state, log_file)
+            elif phase_name in protocol.get("custom_phases", {}):
+                print(f"Phase: {phase_name.upper()} (custom)")
+                state = run_custom_phase(client, protocol, agent_names, state,
+                                         log_file, phase_name)
+            else:
                 print(f"  (unknown phase '{phase_name}', skipping)")
                 continue
-            print(f"Phase: {phase_name.upper()}")
-            state = handler(client, protocol, agent_names, state, log_file)
             print()
 
         winner = state.get("winner")
@@ -428,21 +610,45 @@ def run_iteration(client, protocol, agent_names, iteration, log_file):
     print("=" * 60)
     print("=== META-ROUND: Protocol Self-Improvement ===\n")
     print("Phase: META-PROPOSE")
-    meta_winner = meta_round(client, protocol, agent_names, log_file)
+    meta_winner, meta_votes = meta_round(client, protocol, agent_names, log_file,
+                                          history=history)
     print()
+
+    # Collect and save metrics
+    last_state = state
+    last_state["phases_run"] = protocol["phases"]
+    last_state["num_custom_phases"] = len(protocol.get("custom_phases", {}))
+    metrics = collect_iteration_metrics(last_state, meta_votes,
+                                         len(agent_names), iteration)
+    save_metrics(metrics)
 
     winning_change = meta_winner["change"]
     print(f"Winning change: [{meta_winner['agent']}] — {winning_change.summary}")
     print(f"  {winning_change.field_path} → {winning_change.new_value}")
     print(f"  Rationale: {winning_change.rationale}\n")
 
-    # Apply to a clean reload (don't persist mutated seed_prompt)
+    # Snapshot before applying changes (for rollback)
     clean_protocol = load_protocol()
+    save_snapshot(clean_protocol, iteration)
+
+    # Apply the change
     apply_protocol_change(clean_protocol, winning_change)
     save_protocol(clean_protocol)
 
     log_event(log_file, {"phase": "meta_applied", "iteration": iteration,
                           "change": winning_change.model_dump(), "new_protocol": clean_protocol})
+
+    # Record in evolution history for future iterations
+    new_value_str = str(winning_change.new_value)
+    if history is not None:
+        history.append({
+            "iteration": iteration,
+            "field_path": winning_change.field_path,
+            "new_value_preview": new_value_str[:100],
+            "summary": winning_change.summary,
+            "rationale": winning_change.rationale,
+        })
+        save_history(history)
 
     print("Protocol updated. New protocol:")
     print(json.dumps(clean_protocol, indent=2))
@@ -467,13 +673,18 @@ def main():
     # Back up the original protocol
     shutil.copy("protocol.json", f"{LOG_DIR}/protocol_v0_{timestamp}.json")
 
+    history = load_history()
+
     for iteration in range(1, args.iterations + 1):
-        protocol = run_iteration(client, protocol, agent_names, iteration, log_file)
+        protocol = run_iteration(client, protocol, agent_names, iteration, log_file,
+                                 history=history)
 
     print(f"\n{'='*60}")
     print(f"All {args.iterations} iteration(s) complete.")
     print(f"Log: {log_file}")
     print(f"Protocol evolved through {args.iterations} self-improvement cycle(s).")
+
+    print_metrics_summary()
 
 
 if __name__ == "__main__":

@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .venv/
 logs/
+evolution_history.json
+metrics_log.json
+protocol_snapshots/
