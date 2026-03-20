@@ -2,7 +2,7 @@
 
 A multi-agent system that evolves its own coordination protocol through recursive self-improvement.
 
-Three AI agents collaborate on tasks using a protocol defined in `protocol.json`. After each task cycle, the agents propose, vote on, and apply changes to the protocol itself — modifying phases, roles, voting rules, and even inventing entirely new phase types. The scaffolding code (`main.py`) remains fixed; only the policy evolves.
+Three AI agents collaborate on tasks using a protocol defined in `protocol.json`. After each task cycle, the agents propose, vote on, and apply changes to the protocol itself — modifying phases, roles, and even inventing entirely new phase types. The scaffolding code (`main.py`) remains fixed; only the policy evolves.
 
 ## Quick Start
 
@@ -34,20 +34,20 @@ metrics.py       ← per-iteration metrics tracking
 Each iteration:
 1. **Task rounds** — agents run through the phases defined in the current protocol
 2. **Meta-round** — agents read the protocol, propose one change each, and vote (can't vote for their own proposal)
-3. **Apply** — the winning change is applied to `protocol.json`
+3. **Apply** — the winning change is validated and applied to `protocol.json`
 4. **Repeat** — next iteration uses the updated protocol
 
 **What Agents Can Change**
 - Phase sequence (add, remove, reorder from built-in primitives)
 - Role descriptions (how proposers, critics, refiners behave)
-- Number of rounds per iteration
-- Voting rules
-- **Custom phases** — agents can define entirely new phase types with natural language descriptions
+- Number of rounds per iteration (capped at 5)
+- **Custom phases** — agents can define new phase types with natural language descriptions, though only Proposal-type custom phases currently feed back into the pipeline
 
 **What Agents Cannot Change**
 - The scaffolding code itself
 - The structured output types
 - The meta-round governance (propose → vote on protocol changes)
+- Voting rules (enforced by the scaffolding, not configurable)
 
 ## Observed Evolution
 
@@ -59,9 +59,13 @@ Starting from `["propose", "vote"]` with temperature=0, agents consistently disc
 | 2 | Add refine phase | `propose → critique → refine → vote` |
 | 3 | Loop critique/refine | `propose → critique → refine → critique → refine → vote` |
 | 4 | Add summarize before vote | `... → summarize → vote` |
-| 5+ | Role refinements, custom phases | Agents define new phase types like `consolidate_feedback` |
+| 5+ | Role refinements, custom phases | Agents create new roles, define custom phase types |
 
-The trajectory is highly reproducible at temperature=0 — different runs produce the same structural evolution.
+The trajectory is highly reproducible at temperature=0 — different runs produce the same structural evolution, though not token-identical (GPU nondeterminism).
+
+## Limitations
+
+Agents bounded by fixed primitives converge quickly (3-5 iterations to exhaust the built-in phases). After that, changes shift to role descriptions and custom phases, which are less structurally impactful. This is a fundamental tension: constrained self-modification converges, unconstrained self-modification (write access to own code) is unsafe and unreliable. This project explores how far you can get within the safe boundary.
 
 ## Key Design Decisions
 
@@ -69,7 +73,9 @@ The trajectory is highly reproducible at temperature=0 — different runs produc
 - **Structured output**: all agent responses are typed Pydantic models parsed from JSON, not free text. The scaffolding can mechanically validate and route them.
 - **Iteration memory**: agents see the history of all prior protocol changes, so they don't repeat experiments.
 - **Metrics tracking**: proposal diversity, vote consensus, and critique severity are tracked per-iteration.
-- **Rollback**: if a protocol change causes proposal diversity to collapse, the system automatically reverts.
+- **Rollback**: if a protocol change causes proposal diversity to collapse, the system automatically reverts to the previous snapshot.
+- **Input validation**: protocol changes are validated before applying — invalid phases are filtered, rounds are capped, malformed values are rejected rather than crashing the system.
+- **Retry on failure**: API calls retry up to 3 times on transient errors to survive long autonomous runs.
 
 ## Architecture
 
