@@ -577,7 +577,7 @@ def apply_protocol_change(protocol: dict, change: ProtocolChange) -> bool:
             return False
         custom = set(protocol.get("custom_phases", {}).keys())
         valid = set(AVAILABLE_PHASES) | custom
-        value = [p for p in value if p in valid or p.replace("_", "").isalpha()]
+        value = [p for p in value if isinstance(p, str) and p in valid]
         if not value:
             print("  WARNING: All proposed phases were invalid. Rejecting change.")
             return False
@@ -635,13 +635,17 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
             curr = metrics_log[-1]
             if should_rollback(curr, prev):
                 print("  ROLLBACK: Last protocol change degraded performance.")
-                rolled_back = load_snapshot(iteration - 1)
+                # Snapshot N is saved before applying iteration N's change,
+                # so it contains the protocol *used during* iteration N.
+                # To undo iteration N-1's change, load snapshot N-2.
+                rollback_to = iteration - 2
+                rolled_back = load_snapshot(rollback_to) if rollback_to >= 1 else None
                 if rolled_back:
                     protocol = rolled_back
                     save_protocol(protocol)
                     phases = protocol.get("phases", AVAILABLE_PHASES)
                     rounds = protocol.get("rounds", 1)
-                    print(f"  Reverted to iteration {iteration - 1} snapshot.")
+                    print(f"  Reverted to iteration {rollback_to} snapshot.")
                     if history:
                         history.append({
                             "iteration": iteration,
