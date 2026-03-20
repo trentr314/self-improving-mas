@@ -12,6 +12,8 @@ Available phase primitives (agents can reorder/add/remove these):
   summarize - a single agent summarizes the round's outcome
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -309,15 +311,46 @@ def phase_vote(client, protocol, agent_names, state, log_file):
 
 
 def phase_summarize(client, protocol, agent_names, state, log_file):
-    """One agent summarizes the round outcome."""
+    """Summarize the current state — works before or after voting."""
     winner = state.get("winner")
-    if not winner:
-        print("  (no winner to summarize)")
-        return state
+    proposals = state.get("proposals", [])
+    critiques = state.get("critiques", [])
 
-    print(f"  Summary: [{winner['agent']}] won with: {winner['proposal'].summary}")
-    log_event(log_file, {"phase": "summarize", "winner": winner["agent"],
-                          "summary": winner["proposal"].summary})
+    if winner:
+        # Post-vote: summarize the outcome
+        print(f"  Result: [{winner['agent']}] won with: {winner['proposal'].summary}")
+        log_event(log_file, {"phase": "summarize", "winner": winner["agent"],
+                              "summary": winner["proposal"].summary})
+    elif proposals:
+        # Pre-vote: summarize proposals and critiques for voters
+        system_prompt = protocol.get("roles", {}).get("refiner",
+            protocol.get("roles", {}).get("proposer",
+                "Summarize the current proposals and how critiques were addressed."))
+
+        proposals_text = "\n\n".join(
+            f"[{p['agent']}]: {p['proposal'].summary}\n  {p['proposal'].detail}"
+            for p in proposals
+        )
+        critiques_text = ""
+        if critiques:
+            critiques_text = "\n\nCritiques received:\n" + "\n".join(
+                f"  [{c['critic']}] → [{c['target']}]: {c['critique'].weakness}"
+                for c in critiques
+            )
+
+        prompt = (
+            f"Summarize the current proposals for voters. "
+            f"Highlight key differences and how critiques were addressed.\n\n"
+            f"Proposals:\n{proposals_text}{critiques_text}"
+        )
+        summary = call_agent(client, system_prompt, prompt, Proposal)
+        print(f"  Summary: {summary.summary}")
+        print(f"  {summary.detail}")
+        log_event(log_file, {"phase": "summarize", "summary": summary.model_dump()})
+        state["round_summary"] = summary
+    else:
+        print("  (nothing to summarize)")
+
     return state
 
 
@@ -671,6 +704,7 @@ def main():
     log_file = f"{LOG_DIR}/run_{timestamp}.jsonl"
 
     # Back up the original protocol
+    os.makedirs(LOG_DIR, exist_ok=True)
     shutil.copy("protocol.json", f"{LOG_DIR}/protocol_v0_{timestamp}.json")
 
     history = load_history()
