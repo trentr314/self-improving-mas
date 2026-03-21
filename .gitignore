@@ -5,4 +5,4 @@ __pycache__/
 logs/
 evolution_history.json
 metrics_log.json
-protocol_snapshots/
+PROJECT_REPORT.md

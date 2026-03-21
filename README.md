@@ -32,8 +32,8 @@ metrics.py       ← per-iteration metrics tracking
 **The Self-Improvement Loop**
 
 Each iteration:
-1. **Task rounds** — agents run through the phases defined in the current protocol
-2. **Meta-round** — agents read the protocol, propose one change each, and vote (can't vote for their own proposal)
+1. **Task rounds** — agents run through the `phases` defined in the current protocol (e.g. propose → critique → vote)
+2. **Meta-round** — agents run through the `meta_phases` (e.g. meta_propose → meta_critique → meta_vote), proposing and voting on changes to the protocol — including changes to the meta-round itself
 3. **Apply** — the winning change is validated and applied to `protocol.json`
 4. **Repeat** — next iteration uses the updated protocol
 
@@ -46,8 +46,7 @@ Each iteration:
 **What Agents Cannot Change**
 - The scaffolding code itself
 - The structured output types
-- The meta-round governance (propose → vote on protocol changes)
-- Voting rules (enforced by the scaffolding, not configurable)
+- The requirement that `meta_vote` exists in the meta-round (so agents can never remove their own voting mechanism)
 
 ## Observed Evolution
 
@@ -72,8 +71,7 @@ Agents bounded by fixed primitives converge quickly (3-5 iterations to exhaust t
 - **Enforced governance**: agents can't vote for their own proposals. The scaffolding excludes each agent's proposal from their ballot — no trust required.
 - **Structured output**: all agent responses are typed Pydantic models parsed from JSON, not free text. The scaffolding can mechanically validate and route them.
 - **Iteration memory**: agents see the history of all prior protocol changes, so they don't repeat experiments.
-- **Metrics tracking**: proposal diversity, vote consensus, and critique severity are tracked per-iteration.
-- **Rollback**: if a protocol change causes proposal diversity to collapse, the system automatically reverts to the previous snapshot.
+- **Metrics tracking**: vote consensus, critique length, and phase counts are tracked per-iteration.
 - **Input validation**: protocol changes are validated before applying — invalid phases are filtered, rounds are capped, malformed values are rejected rather than crashing the system.
 - **Retry on failure**: API calls retry up to 3 times on transient errors to survive long autonomous runs.
 

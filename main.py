@@ -4,12 +4,19 @@ Multi-agent scaffolding: mechanism layer.
 This file is the FIXED interpreter. Agents never modify it.
 They iterate on protocol.json instead.
 
-Available phase primitives (agents can reorder/add/remove these):
+Available task phase primitives:
   propose   - each agent generates a proposal
   critique  - each agent critiques others' proposals
   refine    - each agent refines their proposal based on critiques
   vote      - each agent votes on proposals (can't vote for own)
   summarize - a single agent summarizes the round's outcome
+
+Available meta phase primitives:
+  meta_propose   - each agent proposes a protocol change
+  meta_critique  - each agent critiques others' proposed changes
+  meta_refine    - each agent refines their change based on critiques
+  meta_vote      - each agent votes on protocol changes (REQUIRED, can't be removed)
+  meta_summarize - summarize the meta-round outcome
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import time
@@ -26,16 +34,16 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from metrics import (collect_iteration_metrics, load_metrics_log, save_metrics,
+from metrics import (collect_iteration_metrics, save_metrics,
                      print_metrics_summary)
 from models import Critique, Proposal, ProtocolChange, Refinement, Vote
 
 load_dotenv()
 
 AVAILABLE_PHASES = ["propose", "critique", "refine", "vote", "summarize"]
+AVAILABLE_META_PHASES = ["meta_propose", "meta_critique", "meta_refine", "meta_vote", "meta_summarize"]
 LOG_DIR = "logs"
 HISTORY_FILE = "evolution_history.json"
-SNAPSHOTS_DIR = "protocol_snapshots"
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
 
@@ -67,40 +75,6 @@ def format_history_for_prompt(history: list) -> str:
             f"({entry['field_path']} → {entry['new_value_preview']})"
         )
     return "\n".join(lines)
-
-
-def save_snapshot(protocol: dict, iteration: int):
-    """Save a protocol snapshot before applying changes."""
-    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
-    path = os.path.join(SNAPSHOTS_DIR, f"protocol_iter{iteration}.json")
-    with open(path, "w") as f:
-        json.dump(protocol, f, indent=2)
-        f.write("\n")
-
-
-def load_snapshot(iteration: int) -> dict | None:
-    """Load a protocol snapshot from a specific iteration."""
-    path = os.path.join(SNAPSHOTS_DIR, f"protocol_iter{iteration}.json")
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return None
-
-
-def should_rollback(current_metrics: dict, previous_metrics: dict | None) -> bool:
-    """Detect if the last protocol change degraded performance.
-
-    Triggers rollback if proposal diversity drops to near-zero (agents stuck).
-    """
-    if previous_metrics is None:
-        return False
-
-    # If diversity collapsed (all proposals became identical)
-    if (current_metrics["proposal_diversity"] < 0.05
-            and previous_metrics["proposal_diversity"] > 0.1):
-        return True
-
-    return False
 
 
 def create_client():
@@ -317,7 +291,11 @@ def phase_vote(client, protocol, agent_names, state, log_file):
         print("  (no valid votes cast)")
         return state
 
-    winner_name = max(tally, key=tally.get)
+    max_votes = max(tally.values())
+    tied = [name for name, count in tally.items() if count == max_votes]
+    winner_name = random.choice(tied) if len(tied) > 1 else tied[0]
+    if len(tied) > 1:
+        print(f"  (tie between {tied}, randomly selected [{winner_name}])")
     winner = next(p for p in proposals if p["agent"] == winner_name)
 
     log_event(log_file, {"phase": "vote_result", "tally": tally, "winner": winner_name})
@@ -476,22 +454,21 @@ def parse_json_value(raw: str):
     return raw
 
 
-def meta_round(client, protocol, agent_names, log_file, history=None):
-    """Agents propose and vote on changes to the protocol itself."""
-    protocol_text = json.dumps(protocol, indent=2)
+def build_meta_system_prompt(protocol, history):
+    """Build the system prompt shared across meta-round phases."""
     history_text = format_history_for_prompt(history or [])
-
-    system_prompt = (
+    return (
         "You are a systems architect reviewing a multi-agent coordination protocol. "
-        "Propose one specific, concrete change to improve how agents collaborate. "
-        "You can change any field in the protocol. Be practical — small targeted changes "
+        "You can change any field in the protocol — including 'meta_phases', which controls "
+        "the self-improvement process itself. Be practical — small targeted changes "
         "are better than sweeping rewrites.\n\n"
-        f"Available phase primitives: {json.dumps(AVAILABLE_PHASES)}\n"
-        "Agents can use built-in phases OR define custom phases (see custom_phases in the protocol).\n"
+        f"Available task phase primitives: {json.dumps(AVAILABLE_PHASES)}\n"
+        f"Available meta phase primitives: {json.dumps(AVAILABLE_META_PHASES)}\n\n"
+        "Agents can also define custom phases (see custom_phases in the protocol).\n"
         "To propose a custom phase, set field_path to 'custom_phases.<phase_name>' and new_value to "
         'a JSON object with: {"description": "...", "output_model": "Proposal|Critique|Vote", '
         '"multi_agent": true|false}\n'
-        "Then add the phase name to the 'phases' array.\n\n"
+        "Then add the phase name to the 'phases' or 'meta_phases' array.\n\n"
         "IMPORTANT: For the new_value field, provide valid JSON. "
         "For arrays: [\"propose\",\"critique\",\"vote\"] "
         "For strings: just the string without outer quotes. "
@@ -499,7 +476,17 @@ def meta_round(client, protocol, agent_names, log_file, history=None):
         f"Evolution history — learn from what was already tried:\n{history_text}"
     )
 
-    # Propose
+
+# === META-PHASE HANDLERS ===
+# Mirror the task phase pattern but operate on protocol changes instead of task proposals.
+# meta_state carries: meta_proposals, meta_critiques, meta_winner
+
+
+def meta_phase_propose(client, protocol, agent_names, meta_state, log_file, history):
+    """Each agent proposes a change to the protocol."""
+    protocol_text = json.dumps(protocol, indent=2)
+    system_prompt = build_meta_system_prompt(protocol, history)
+
     proposals = []
     for name in agent_names:
         prompt = (
@@ -514,9 +501,104 @@ def meta_round(client, protocol, agent_names, log_file, history=None):
         print(f"  [{name}] {change.summary}")
         print(f"         {change.field_path} → {change.new_value}")
 
-    # Vote
-    print()
-    print("Phase: META-VOTE")
+    meta_state["meta_proposals"] = proposals
+    return meta_state
+
+
+def meta_phase_critique(client, protocol, agent_names, meta_state, log_file, history):
+    """Each agent critiques the other agents' proposed protocol changes."""
+    proposals = meta_state.get("meta_proposals", [])
+    if not proposals:
+        print("  (no proposals to critique)")
+        return meta_state
+
+    system_prompt = protocol.get("roles", {}).get("critic",
+        "You are a sharp but constructive critic. Find weaknesses and suggest fixes. Be concise.")
+    critiques = []
+
+    for critic_name in agent_names:
+        others = [p for p in proposals if p["agent"] != critic_name]
+        if not others:
+            continue
+
+        options_text = "\n\n".join(
+            f"Change {i}: [{p['agent']}]\n"
+            f"  Field: {p['change'].field_path} → {p['change'].new_value}\n"
+            f"  Summary: {p['change'].summary}\n"
+            f"  Rationale: {p['change'].rationale}"
+            for i, p in enumerate(others)
+        )
+        prompt = (
+            f"You are agent '{critic_name}'. Critique the weakest proposed protocol change.\n\n"
+            f"{options_text}\n\n"
+            f"Pick the change with the biggest weakness (index 0 to {len(others)-1}) "
+            f"and explain the weakness and how to fix it."
+        )
+        critique = call_agent(client, system_prompt, prompt, Critique)
+        critique.target_proposal = max(0, min(critique.target_proposal, len(others) - 1))
+        target = others[critique.target_proposal]
+
+        critiques.append({"critic": critic_name, "target": target["agent"], "critique": critique})
+        log_event(log_file, {"phase": "meta_critique", "critic": critic_name,
+                              "target": target["agent"], "critique": critique.model_dump()})
+        print(f"  [{critic_name}] → [{target['agent']}]: {critique.weakness[:80]}...")
+
+    meta_state["meta_critiques"] = critiques
+    return meta_state
+
+
+def meta_phase_refine(client, protocol, agent_names, meta_state, log_file, history):
+    """Each agent refines their protocol change proposal based on critiques."""
+    proposals = meta_state.get("meta_proposals", [])
+    critiques = meta_state.get("meta_critiques", [])
+    if not proposals or not critiques:
+        print("  (nothing to refine)")
+        return meta_state
+
+    system_prompt = build_meta_system_prompt(protocol, history)
+    refined = []
+
+    for entry in proposals:
+        name = entry["agent"]
+        change = entry["change"]
+
+        my_critiques = [c for c in critiques if c["target"] == name]
+        if not my_critiques:
+            refined.append(entry)
+            continue
+
+        critique_text = "\n".join(
+            f"- [{c['critic']}] Weakness: {c['critique'].weakness}\n"
+            f"  Suggested fix: {c['critique'].suggested_fix}"
+            for c in my_critiques
+        )
+        prompt = (
+            f"You are agent '{name}'. Here is your original protocol change proposal:\n\n"
+            f"  Field: {change.field_path} → {change.new_value}\n"
+            f"  Summary: {change.summary}\n"
+            f"  Rationale: {change.rationale}\n\n"
+            f"You received these critiques:\n{critique_text}\n\n"
+            f"Refine your proposal to address the feedback. "
+            f"Keep the same field_path or change it if the critique warrants."
+        )
+        refined_change = call_agent(client, system_prompt, prompt, ProtocolChange)
+        refined.append({"agent": name, "change": refined_change})
+        log_event(log_file, {"phase": "meta_refine", "agent": name,
+                              "change": refined_change.model_dump()})
+        print(f"  [{name}] refined: {refined_change.summary}")
+        print(f"         {refined_change.field_path} → {refined_change.new_value}")
+
+    meta_state["meta_proposals"] = refined
+    return meta_state
+
+
+def meta_phase_vote(client, protocol, agent_names, meta_state, log_file, history):
+    """Each agent votes on protocol changes (can't vote for own)."""
+    proposals = meta_state.get("meta_proposals", [])
+    if not proposals:
+        print("  (no proposals to vote on)")
+        return meta_state
+
     vote_prompt = (
         "You are evaluating proposed changes to a multi-agent coordination protocol. "
         "Vote for the change that would most improve collaboration quality. "
@@ -525,6 +607,8 @@ def meta_round(client, protocol, agent_names, log_file, history=None):
     votes = []
     for voter in agent_names:
         options = [p for p in proposals if p["agent"] != voter]
+        if not options:
+            continue
         options_text = "\n\n".join(
             f"Change {i}: [{p['agent']}]\n"
             f"  Field: {p['change'].field_path} → {p['change'].new_value}\n"
@@ -550,12 +634,55 @@ def meta_round(client, protocol, agent_names, log_file, history=None):
         tally[v["voted_for"]] = tally.get(v["voted_for"], 0) + 1
 
     if not tally:
-        return None, votes
+        return meta_state
 
-    winner_name = max(tally, key=tally.get)
+    max_votes = max(tally.values())
+    tied = [name for name, count in tally.items() if count == max_votes]
+    winner_name = random.choice(tied) if len(tied) > 1 else tied[0]
+    if len(tied) > 1:
+        print(f"  (tie between {tied}, randomly selected [{winner_name}])")
     winner = next(p for p in proposals if p["agent"] == winner_name)
 
-    return winner, votes
+    meta_state["meta_winner"] = winner
+    meta_state["meta_votes"] = votes
+    return meta_state
+
+
+def meta_phase_summarize(client, protocol, agent_names, meta_state, log_file, history):
+    """Summarize the meta-round outcome."""
+    winner = meta_state.get("meta_winner")
+    if winner:
+        print(f"  Result: [{winner['agent']}] won with: {winner['change'].summary}")
+    else:
+        print("  (no winner to summarize)")
+    return meta_state
+
+
+META_PHASE_HANDLERS = {
+    "meta_propose": meta_phase_propose,
+    "meta_critique": meta_phase_critique,
+    "meta_refine": meta_phase_refine,
+    "meta_vote": meta_phase_vote,
+    "meta_summarize": meta_phase_summarize,
+}
+
+
+def run_meta_round(client, protocol, agent_names, log_file, history=None):
+    """Run the meta-round using the data-driven meta_phases from the protocol."""
+    meta_phases = protocol.get("meta_phases", ["meta_propose", "meta_vote"])
+    meta_state = {}
+
+    for phase_name in meta_phases:
+        handler = META_PHASE_HANDLERS.get(phase_name)
+        if handler:
+            print(f"Phase: {phase_name.upper()}")
+            meta_state = handler(client, protocol, agent_names, meta_state, log_file, history)
+        else:
+            print(f"  (unknown meta phase '{phase_name}', skipping)")
+            continue
+        print()
+
+    return meta_state.get("meta_winner"), meta_state.get("meta_votes", [])
 
 
 def apply_protocol_change(protocol: dict, change: ProtocolChange) -> bool:
@@ -580,6 +707,21 @@ def apply_protocol_change(protocol: dict, change: ProtocolChange) -> bool:
         value = [p for p in value if isinstance(p, str) and p in valid]
         if not value:
             print("  WARNING: All proposed phases were invalid. Rejecting change.")
+            return False
+
+    # Validate meta_phases — must be a list and must always contain meta_vote
+    if change.field_path == "meta_phases":
+        if not isinstance(value, list):
+            print(f"  WARNING: 'meta_phases' must be a list, got {type(value).__name__}. Rejecting change.")
+            return False
+        custom = set(protocol.get("custom_phases", {}).keys())
+        valid = set(AVAILABLE_META_PHASES) | custom
+        value = [p for p in value if isinstance(p, str) and p in valid]
+        if "meta_vote" not in value:
+            print("  WARNING: 'meta_phases' must always contain 'meta_vote'. Rejecting change.")
+            return False
+        if not value:
+            print("  WARNING: All proposed meta phases were invalid. Rejecting change.")
             return False
 
     # Validate rounds — must be a positive integer
@@ -621,41 +763,14 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
     phases = protocol.get("phases", AVAILABLE_PHASES)
     rounds = protocol.get("rounds", 1)
 
+    meta_phases = protocol.get("meta_phases", ["meta_propose", "meta_vote"])
+
     print(f"\n{'#'*60}")
     print(f"# ITERATION {iteration}")
-    print(f"# Phases: {phases}")
+    print(f"# Task phases: {phases}")
+    print(f"# Meta phases: {meta_phases}")
     print(f"# Rounds: {rounds}")
     print(f"{'#'*60}\n")
-
-    # Check if previous iteration degraded performance — rollback if so
-    if iteration > 1:
-        metrics_log = load_metrics_log()
-        if len(metrics_log) >= 2:
-            prev = metrics_log[-2]
-            curr = metrics_log[-1]
-            if should_rollback(curr, prev):
-                print("  ROLLBACK: Last protocol change degraded performance.")
-                # Snapshot N is saved before applying iteration N's change,
-                # so it contains the protocol *used during* iteration N.
-                # To undo iteration N-1's change, load snapshot N-2.
-                rollback_to = iteration - 2
-                rolled_back = load_snapshot(rollback_to) if rollback_to >= 1 else None
-                if rolled_back:
-                    protocol = rolled_back
-                    save_protocol(protocol)
-                    phases = protocol.get("phases", AVAILABLE_PHASES)
-                    rounds = protocol.get("rounds", 1)
-                    print(f"  Reverted to iteration {rollback_to} snapshot.")
-                    if history:
-                        history.append({
-                            "iteration": iteration,
-                            "field_path": "ROLLBACK",
-                            "new_value_preview": f"Reverted to iteration {iteration - 1}",
-                            "summary": "Automatic rollback due to performance degradation",
-                            "rationale": "Proposal diversity collapsed after last change",
-                        })
-                        save_history(history)
-                    print()
 
     # Preserve the original seed_prompt — task rounds mutate it for context
     # building, but we don't want to persist that to disk
@@ -691,12 +806,13 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
                 f"Build on this. Propose the next concrete improvement."
             )
 
-    # Meta-round
+    # Meta-round — data-driven from meta_phases in the protocol
+    meta_phases = protocol.get("meta_phases", ["meta_propose", "meta_vote"])
     print("=" * 60)
-    print("=== META-ROUND: Protocol Self-Improvement ===\n")
-    print("Phase: META-PROPOSE")
-    meta_winner, meta_votes = meta_round(client, protocol, agent_names, log_file,
-                                          history=history)
+    print(f"=== META-ROUND: Protocol Self-Improvement ===")
+    print(f"=== Meta-phases: {meta_phases}\n")
+    meta_winner, meta_votes = run_meta_round(client, protocol, agent_names, log_file,
+                                              history=history)
 
     if meta_winner is None:
         print("  No valid meta-round winner. Keeping current protocol.\n")
@@ -716,11 +832,10 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
     print(f"  {winning_change.field_path} → {winning_change.new_value}")
     print(f"  Rationale: {winning_change.rationale}\n")
 
-    # Restore original seed_prompt before snapshotting/saving
+    # Restore original seed_prompt — task rounds mutate it for context
+    # chaining, but we don't want to persist that to disk
     protocol["seed_prompt"] = original_seed
 
-    # Snapshot current protocol for rollback, then apply the change
-    save_snapshot(protocol, iteration)
     applied = apply_protocol_change(protocol, winning_change)
 
     if applied:

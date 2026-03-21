@@ -1,9 +1,13 @@
 {
   "rounds": 1,
-  "seed_prompt": "Design a simple system where AI agents can collaborate to solve problems better than any single agent.",
+  "seed_prompt": "Design a text-based adventure game that's fun to play in a terminal. Think about the core mechanics, world structure, and player interaction model.",
   "phases": [
     "propose",
     "vote"
+  ],
+  "meta_phases": [
+    "meta_propose",
+    "meta_vote"
   ],
   "roles": {
     "proposer": "You are a creative problem-solver. Propose a concrete, actionable idea. Be specific and concise.",
