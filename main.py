@@ -667,6 +667,56 @@ META_PHASE_HANDLERS = {
 }
 
 
+def run_custom_meta_phase(client, protocol, agent_names, meta_state, log_file, phase_name):
+    """Execute a custom phase within the meta-round, using meta_state keys."""
+    custom_def = protocol.get("custom_phases", {}).get(phase_name, {})
+    description = custom_def.get("description", f"Execute the '{phase_name}' phase.")
+    model_name = custom_def.get("output_model", "Proposal")
+    multi_agent = custom_def.get("multi_agent", True)
+    schema = CUSTOM_PHASE_MODELS.get(model_name, Proposal)
+
+    # Build context from meta-round state (not task state)
+    context_parts = []
+    if meta_state.get("meta_proposals"):
+        context_parts.append("Current protocol change proposals:")
+        for p in meta_state["meta_proposals"]:
+            context_parts.append(f"  [{p['agent']}] {p['change'].summary}: {p['change'].rationale}")
+    if meta_state.get("meta_winner"):
+        w = meta_state["meta_winner"]
+        context_parts.append(f"Current winner: [{w['agent']}] {w['change'].summary}")
+    context = "\n".join(context_parts) if context_parts else "No prior meta phase data."
+
+    system_prompt = (
+        f"You are participating in a meta-round phase called '{phase_name}'.\n\n"
+        f"Phase instructions: {description}\n\n"
+        f"You are evaluating changes to the coordination protocol itself."
+    )
+
+    agents_to_run = agent_names if multi_agent else agent_names[:1]
+    results = []
+
+    for name in agents_to_run:
+        prompt = (
+            f"You are agent '{name}'. Execute the '{phase_name}' phase.\n\n"
+            f"Meta-round context:\n{context}\n\n"
+            f"Follow the phase instructions and produce your output."
+        )
+        result = call_agent(client, system_prompt, prompt, schema)
+        results.append({"agent": name, "result": result})
+        log_event(log_file, {"phase": phase_name, "agent": name,
+                              "result": result.model_dump()})
+
+        if hasattr(result, "summary"):
+            print(f"  [{name}] {result.summary}")
+        elif hasattr(result, "reasoning"):
+            print(f"  [{name}] {result.reasoning[:80]}...")
+        elif hasattr(result, "weakness"):
+            print(f"  [{name}] {result.weakness[:80]}...")
+
+    meta_state[f"custom_{phase_name}"] = results
+    return meta_state
+
+
 def run_meta_round(client, protocol, agent_names, log_file, history=None):
     """Run the meta-round using the data-driven meta_phases from the protocol."""
     meta_phases = protocol.get("meta_phases", ["meta_propose", "meta_vote"])
@@ -677,6 +727,10 @@ def run_meta_round(client, protocol, agent_names, log_file, history=None):
         if handler:
             print(f"Phase: {phase_name.upper()}")
             meta_state = handler(client, protocol, agent_names, meta_state, log_file, history)
+        elif phase_name in protocol.get("custom_phases", {}):
+            print(f"Phase: {phase_name.upper()} (custom)")
+            meta_state = run_custom_meta_phase(client, protocol, agent_names, meta_state,
+                                                log_file, phase_name)
         else:
             print(f"  (unknown meta phase '{phase_name}', skipping)")
             continue
@@ -688,6 +742,20 @@ def run_meta_round(client, protocol, agent_names, log_file, history=None):
 def apply_protocol_change(protocol: dict, change: ProtocolChange) -> bool:
     """Apply a voted-on change to the protocol. Returns True if applied, False if rejected."""
     value = parse_json_value(change.new_value)
+
+    # Protect structural keys — these must remain their expected types
+    STRUCTURAL_TYPES = {
+        "phases": list,
+        "meta_phases": list,
+        "roles": dict,
+        "custom_phases": dict,
+    }
+    if change.field_path in STRUCTURAL_TYPES:
+        expected = STRUCTURAL_TYPES[change.field_path]
+        if not isinstance(value, expected):
+            print(f"  WARNING: '{change.field_path}' must be a {expected.__name__}, "
+                  f"got {type(value).__name__}. Rejecting change.")
+            return False
 
     # Validate custom phase definitions
     if change.field_path.startswith("custom_phases.") and isinstance(value, dict):
@@ -717,8 +785,8 @@ def apply_protocol_change(protocol: dict, change: ProtocolChange) -> bool:
         custom = set(protocol.get("custom_phases", {}).keys())
         valid = set(AVAILABLE_META_PHASES) | custom
         value = [p for p in value if isinstance(p, str) and p in valid]
-        if "meta_vote" not in value:
-            print("  WARNING: 'meta_phases' must always contain 'meta_vote'. Rejecting change.")
+        if "meta_vote" not in value or "meta_propose" not in value:
+            print("  WARNING: 'meta_phases' must always contain 'meta_propose' and 'meta_vote'. Rejecting change.")
             return False
         if not value:
             print("  WARNING: All proposed meta phases were invalid. Rejecting change.")
@@ -814,6 +882,10 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
     meta_winner, meta_votes = run_meta_round(client, protocol, agent_names, log_file,
                                               history=history)
 
+    # Restore original seed_prompt — task rounds mutate it for context
+    # chaining, but we don't want to persist that to disk
+    protocol["seed_prompt"] = original_seed
+
     if meta_winner is None:
         print("  No valid meta-round winner. Keeping current protocol.\n")
         return protocol
@@ -831,10 +903,6 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
     print(f"Winning change: [{meta_winner['agent']}] — {winning_change.summary}")
     print(f"  {winning_change.field_path} → {winning_change.new_value}")
     print(f"  Rationale: {winning_change.rationale}\n")
-
-    # Restore original seed_prompt — task rounds mutate it for context
-    # chaining, but we don't want to persist that to disk
-    protocol["seed_prompt"] = original_seed
 
     applied = apply_protocol_change(protocol, winning_change)
 

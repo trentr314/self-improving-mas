@@ -46,7 +46,7 @@ Each iteration:
 **What Agents Cannot Change**
 - The scaffolding code itself
 - The structured output types
-- The requirement that `meta_vote` exists in the meta-round (so agents can never remove their own voting mechanism)
+- The requirement that `meta_propose` and `meta_vote` exist in the meta-round (agents can never remove their ability to propose or vote on changes)
 
 ## Observed Evolution
 
@@ -60,7 +60,7 @@ Starting from `["propose", "vote"]` with temperature=0, agents consistently disc
 | 4 | Add summarize before vote | `... → summarize → vote` |
 | 5+ | Role refinements, custom phases | Agents create new roles, define custom phase types |
 
-The trajectory is highly reproducible at temperature=0 — different runs produce the same structural evolution, though not token-identical (GPU nondeterminism).
+The structural trajectory is broadly consistent across runs at temperature=0, though not identical — GPU nondeterminism and random tiebreaking can cause variation in later iterations.
 
 ## Limitations
 
