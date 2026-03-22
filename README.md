@@ -2,12 +2,17 @@
 
 A multi-agent system that evolves its own coordination protocol through recursive self-improvement.
 
-Three AI agents collaborate on tasks using a protocol defined in `protocol.json`. After each task cycle, the agents propose, vote on, and apply changes to the protocol itself — modifying phases, roles, and even inventing entirely new phase types. The scaffolding code (`main.py`) remains fixed; only the policy evolves.
+Three AI agents collaborate on a task using a protocol defined in `protocol.json`. After each task cycle, the agents propose, vote on, and apply changes to the protocol itself — modifying phases, roles, and even inventing entirely new phase types. The scaffolding code (`main.py`) remains fixed; only the policy evolves.
+
+The system has two parallel evolution tracks: **task phases** (how agents work on the task) and **meta phases** (how agents improve the protocol). Both start minimal and both can grow — agents can modify their own self-improvement process.
 
 ## Quick Start
 
 ```bash
-git clone <repo-url> && cd mas_project
+git clone https://github.com/trentr314/self-improving-mas.git
+cd self-improving-mas
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 # Add your Google AI API key to .env (get one at https://aistudio.google.com/apikey)
@@ -38,10 +43,11 @@ Each iteration:
 4. **Repeat** — next iteration uses the updated protocol
 
 **What Agents Can Change**
-- Phase sequence (add, remove, reorder from built-in primitives)
+- Task phase sequence (add, remove, reorder from built-in primitives)
+- Meta phase sequence (same primitives, mirrored for the self-improvement process)
 - Role descriptions (how proposers, critics, refiners behave)
 - Number of rounds per iteration (capped at 5)
-- **Custom phases** — agents can define new phase types with natural language descriptions, though only Proposal-type custom phases currently feed back into the pipeline
+- **Custom phases** — agents can define new phase types with natural language descriptions, usable in both task and meta rounds
 
 **What Agents Cannot Change**
 - The scaffolding code itself
@@ -50,15 +56,14 @@ Each iteration:
 
 ## Observed Evolution
 
-Starting from `["propose", "vote"]` with temperature=0, agents consistently discover:
+Starting from minimal seeds (`phases: ["propose", "vote"]`, `meta_phases: ["meta_propose", "meta_vote"]`) with temperature=0, agents consistently discover:
 
-| Iteration | Change | Protocol State |
-|-----------|--------|----------------|
-| 1 | Add critique phase | `propose → critique → vote` |
-| 2 | Add refine phase | `propose → critique → refine → vote` |
-| 3 | Loop critique/refine | `propose → critique → refine → critique → refine → vote` |
-| 4 | Add summarize before vote | `... → summarize → vote` |
-| 5+ | Role refinements, custom phases | Agents create new roles, define custom phase types |
+| Iteration | Change | What Evolved |
+|-----------|--------|--------------|
+| 1 | Add critique + refine to task phases | `propose → critique → refine → vote` |
+| 2 | Add meta_critique + meta_refine to meta phases | Meta-round gains its own deliberation cycle |
+| 3 | Add summarize to task phases | `propose → critique → refine → vote → summarize` |
+| 4+ | Role refinements, custom phases | Agents define new roles and invent custom phase types |
 
 The structural trajectory is broadly consistent across runs at temperature=0, though not identical — GPU nondeterminism and random tiebreaking can cause variation in later iterations.
 
@@ -72,27 +77,31 @@ Agents bounded by fixed primitives converge quickly (3-5 iterations to exhaust t
 - **Structured output**: all agent responses are typed Pydantic models parsed from JSON, not free text. The scaffolding can mechanically validate and route them.
 - **Iteration memory**: agents see the history of all prior protocol changes, so they don't repeat experiments.
 - **Metrics tracking**: vote consensus, critique length, and phase counts are tracked per-iteration.
-- **Input validation**: protocol changes are validated before applying — invalid phases are filtered, rounds are capped, malformed values are rejected rather than crashing the system.
+- **Input validation**: protocol changes are validated before applying — invalid phases are filtered, rounds are capped, structural types are enforced, malformed values are rejected rather than crashing the system.
 - **Retry on failure**: API calls retry up to 3 times on transient errors to survive long autonomous runs.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│              main.py (fixed)            │
-│  ┌─────────┐  ┌──────────┐  ┌───────┐  │
-│  │ propose │→ │ critique │→ │ vote  │  │  ← phase handlers
-│  └─────────┘  └──────────┘  └───────┘  │
-│        ↑                                │
-│   protocol.json (evolving policy)       │
-│        ↑                                │
-│  ┌──────────────────────────┐           │
-│  │  META-ROUND              │           │
-│  │  agents propose/vote on  │           │
-│  │  protocol changes        │           │
-│  └──────────────────────────┘           │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                main.py (fixed)                   │
+│                                                  │
+│  Task Phases              Meta Phases            │
+│  ┌─────────┐              ┌──────────────┐      │
+│  │ propose │              │ meta_propose │      │
+│  │ critique│  ← evolves   │ meta_critique│      │
+│  │ refine  │    via        │ meta_refine  │      │
+│  │ vote    │    meta       │ meta_vote    │      │
+│  │summarize│    rounds     │meta_summarize│      │
+│  └─────────┘              └──────┬───────┘      │
+│       ↑                          │               │
+│       └──── protocol.json ◄──────┘               │
+│             (evolving policy)                    │
+└──────────────────────────────────────────────────┘
 ```
+
+Both tracks start minimal and grow independently.
+Agents modify task phases through the meta-round, and can modify the meta-round itself — true recursive self-improvement.
 
 ## Inspiration
 
