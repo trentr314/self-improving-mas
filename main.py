@@ -1,8 +1,8 @@
 """
 Multi-agent scaffolding: mechanism layer.
 
-This file is the FIXED interpreter. Agents never modify it.
-They iterate on protocol.json instead.
+This file is the fixed interpreter. Agents never modify it;
+they edit protocol.json instead.
 
 Available task phase primitives:
   propose   - each agent generates a proposal
@@ -15,8 +15,10 @@ Available meta phase primitives:
   meta_propose   - each agent proposes a protocol change
   meta_critique  - each agent critiques others' proposed changes
   meta_refine    - each agent refines their change based on critiques
-  meta_vote      - each agent votes on protocol changes (REQUIRED, can't be removed)
+  meta_vote      - each agent votes on protocol changes
   meta_summarize - summarize the meta-round outcome
+
+meta_propose and meta_vote can't be removed from meta_phases.
 """
 
 from __future__ import annotations
@@ -128,8 +130,8 @@ def call_agent(client, system_prompt: str, user_prompt: str, schema):
 
 
 # === PHASE HANDLERS ===
-# Each takes (client, protocol, agent_names, round_state) and returns updated round_state.
-# round_state carries data between phases within a round.
+# Each takes (client, protocol, agent_names, state, log_file) and returns state,
+# which carries data between phases within a round.
 
 
 def phase_propose(client, protocol, agent_names, state, log_file):
@@ -210,7 +212,6 @@ def phase_refine(client, protocol, agent_names, state, log_file):
         name = entry["agent"]
         proposal = entry["proposal"]
 
-        # Gather critiques aimed at this agent
         my_critiques = [c for c in critiques if c["target"] == name]
         if not my_critiques:
             refined.append(entry)  # no critiques, keep original
@@ -231,7 +232,6 @@ def phase_refine(client, protocol, agent_names, state, log_file):
         )
         refinement = call_agent(client, system_prompt, prompt, Refinement)
 
-        # Replace the proposal with the refined version
         refined_proposal = Proposal(
             summary=refinement.summary,
             detail=refinement.detail,
@@ -304,7 +304,7 @@ def phase_vote(client, protocol, agent_names, state, log_file):
 
 
 def phase_summarize(client, protocol, agent_names, state, log_file):
-    """Summarize the current state — works before or after voting."""
+    """Summarize the round. Works before or after voting."""
     winner = state.get("winner")
     proposals = state.get("proposals", [])
     critiques = state.get("critiques", [])
@@ -355,7 +355,6 @@ PHASE_HANDLERS = {
     "summarize": phase_summarize,
 }
 
-# Models available for custom phases to use
 CUSTOM_PHASE_MODELS = {
     "Proposal": Proposal,
     "Critique": Critique,
@@ -372,7 +371,6 @@ def run_custom_phase(client, protocol, agent_names, state, log_file, phase_name)
     multi_agent = custom_def.get("multi_agent", True)
     schema = CUSTOM_PHASE_MODELS.get(model_name, Proposal)
 
-    # Build context from current round state
     context_parts = []
     if state.get("proposals"):
         context_parts.append("Current proposals:")
@@ -403,7 +401,6 @@ def run_custom_phase(client, protocol, agent_names, state, log_file, phase_name)
         log_event(log_file, {"phase": phase_name, "agent": name,
                               "result": result.model_dump()})
 
-        # Print a sensible summary based on model type
         if hasattr(result, "summary"):
             print(f"  [{name}] {result.summary}")
         elif hasattr(result, "reasoning"):
@@ -411,7 +408,7 @@ def run_custom_phase(client, protocol, agent_names, state, log_file, phase_name)
         elif hasattr(result, "weakness"):
             print(f"  [{name}] {result.weakness[:80]}...")
 
-    # Store results — if using Proposal model, also update proposals
+    # Proposal outputs also join the proposal pool so later phases see them
     state[f"custom_{phase_name}"] = results
     if model_name == "Proposal":
         state.setdefault("proposals", []).extend(
@@ -426,22 +423,20 @@ def run_custom_phase(client, protocol, agent_names, state, log_file, phase_name)
 
 def parse_json_value(raw: str):
     """Parse a JSON value from an agent's response, handling common escaping issues."""
-    # Try direct parse first
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Try stripping outer quotes and unescaping (handles \"propose\" → "propose")
+    # Strip outer quotes and unescape, e.g. \"propose\" -> "propose"
     stripped = raw.strip().strip('"').strip("'")
-    # Fix escaped quotes
     cleaned = stripped.replace('\\"', '"').replace("\\'", "'")
     try:
         return json.loads(cleaned)
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Try to find a JSON structure inside the string
+    # Look for a JSON array/object embedded in the string
     for pattern in [r'\[.*\]', r'\{.*\}']:
         match = re.search(pattern, cleaned, re.DOTALL)
         if match:
@@ -450,7 +445,6 @@ def parse_json_value(raw: str):
             except (json.JSONDecodeError, TypeError):
                 pass
 
-    # Give up, return as string
     return raw
 
 
@@ -459,8 +453,8 @@ def build_meta_system_prompt(protocol, history):
     history_text = format_history_for_prompt(history or [])
     return (
         "You are a systems architect reviewing a multi-agent coordination protocol. "
-        "You can change any field in the protocol — including 'meta_phases', which controls "
-        "the self-improvement process itself. Be practical — small targeted changes "
+        "You can change any field in the protocol, including 'meta_phases', which controls "
+        "the self-improvement process itself. Be practical: small targeted changes "
         "are better than sweeping rewrites.\n\n"
         f"Available task phase primitives: {json.dumps(AVAILABLE_PHASES)}\n"
         f"Available meta phase primitives: {json.dumps(AVAILABLE_META_PHASES)}\n\n"
@@ -473,7 +467,7 @@ def build_meta_system_prompt(protocol, history):
         "For arrays: [\"propose\",\"critique\",\"vote\"] "
         "For strings: just the string without outer quotes. "
         "For numbers: just the number.\n\n"
-        f"Evolution history — learn from what was already tried:\n{history_text}"
+        f"Evolution history (learn from what was already tried):\n{history_text}"
     )
 
 
@@ -743,7 +737,7 @@ def apply_protocol_change(protocol: dict, change: ProtocolChange) -> bool:
     """Apply a voted-on change to the protocol. Returns True if applied, False if rejected."""
     value = parse_json_value(change.new_value)
 
-    # Protect structural keys — these must remain their expected types
+    # The run loop expects these keys to keep their types
     STRUCTURAL_TYPES = {
         "phases": list,
         "meta_phases": list,
@@ -765,11 +759,8 @@ def apply_protocol_change(protocol: dict, change: ProtocolChange) -> bool:
         if value.get("output_model") not in CUSTOM_PHASE_MODELS:
             value["output_model"] = "Proposal"
 
-    # Validate phases — must be a list of known or custom phase names
+    # Drop phase names that aren't built-in or defined in custom_phases
     if change.field_path == "phases":
-        if not isinstance(value, list):
-            print(f"  WARNING: 'phases' must be a list, got {type(value).__name__}. Rejecting change.")
-            return False
         custom = set(protocol.get("custom_phases", {}).keys())
         valid = set(AVAILABLE_PHASES) | custom
         value = [p for p in value if isinstance(p, str) and p in valid]
@@ -777,29 +768,20 @@ def apply_protocol_change(protocol: dict, change: ProtocolChange) -> bool:
             print("  WARNING: All proposed phases were invalid. Rejecting change.")
             return False
 
-    # Validate meta_phases — must be a list and must always contain meta_vote
     if change.field_path == "meta_phases":
-        if not isinstance(value, list):
-            print(f"  WARNING: 'meta_phases' must be a list, got {type(value).__name__}. Rejecting change.")
-            return False
         custom = set(protocol.get("custom_phases", {}).keys())
         valid = set(AVAILABLE_META_PHASES) | custom
         value = [p for p in value if isinstance(p, str) and p in valid]
         if "meta_vote" not in value or "meta_propose" not in value:
             print("  WARNING: 'meta_phases' must always contain 'meta_propose' and 'meta_vote'. Rejecting change.")
             return False
-        if not value:
-            print("  WARNING: All proposed meta phases were invalid. Rejecting change.")
-            return False
 
-    # Validate rounds — must be a positive integer
     if change.field_path == "rounds":
         if not isinstance(value, int) or value < 1:
             print(f"  WARNING: 'rounds' must be a positive integer, got {value!r}. Rejecting change.")
             return False
         value = min(value, 5)  # cap to prevent runaway costs
 
-    # Navigate to the target field and apply
     try:
         keys = change.field_path.split(".")
         target = protocol
@@ -840,12 +822,11 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
     print(f"# Rounds: {rounds}")
     print(f"{'#'*60}\n")
 
-    # Preserve the original seed_prompt — task rounds mutate it for context
-    # building, but we don't want to persist that to disk
+    # Task rounds overwrite seed_prompt to chain each winner into the next round.
+    # Keep the original so the chained version doesn't get saved to disk.
     original_seed = protocol.get("seed_prompt", "")
 
-    # Task rounds — initialize state before the loop to avoid UnboundLocalError
-    state = {}
+    state = {}  # read after the loop, so it has to exist even if rounds == 0
     for round_num in range(rounds):
         print(f"=== Round {round_num + 1} ===\n")
         state = {}
@@ -866,7 +847,7 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
 
         winner = state.get("winner")
         if winner:
-            print(f"Winner: [{winner['agent']}] — {winner['proposal'].summary}")
+            print(f"Winner: [{winner['agent']}] {winner['proposal'].summary}")
             print(f"  {winner['proposal'].detail}\n")
             protocol["seed_prompt"] = (
                 f"Previous winning proposal: {winner['proposal'].summary}\n"
@@ -874,24 +855,20 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
                 f"Build on this. Propose the next concrete improvement."
             )
 
-    # Meta-round — data-driven from meta_phases in the protocol
-    meta_phases = protocol.get("meta_phases", ["meta_propose", "meta_vote"])
     print("=" * 60)
-    print(f"=== META-ROUND: Protocol Self-Improvement ===")
+    print("=== META-ROUND ===")
     print(f"=== Meta-phases: {meta_phases}\n")
     meta_winner, meta_votes = run_meta_round(client, protocol, agent_names, log_file,
                                               history=history)
 
-    # Restore original seed_prompt — task rounds mutate it for context
-    # chaining, but we don't want to persist that to disk
     protocol["seed_prompt"] = original_seed
 
     if meta_winner is None:
         print("  No valid meta-round winner. Keeping current protocol.\n")
         return protocol
 
-    # Collect and save metrics BEFORE applying the change (so metrics reflect
-    # the protocol that was actually used this iteration)
+    # Save metrics before applying the change, so they describe the protocol
+    # that was actually used this iteration
     state["phases_run"] = phases
     state["num_custom_phases"] = len(protocol.get("custom_phases", {}))
     metrics = collect_iteration_metrics(state, meta_votes,
@@ -900,7 +877,7 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
 
     print()
     winning_change = meta_winner["change"]
-    print(f"Winning change: [{meta_winner['agent']}] — {winning_change.summary}")
+    print(f"Winning change: [{meta_winner['agent']}] {winning_change.summary}")
     print(f"  {winning_change.field_path} → {winning_change.new_value}")
     print(f"  Rationale: {winning_change.rationale}\n")
 
@@ -934,20 +911,18 @@ def run_iteration(client, protocol, agent_names, iteration, log_file, history=No
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Self-improving multi-agent system")
+    parser = argparse.ArgumentParser(description="Agents that vote on changes to their own protocol")
     parser.add_argument("-n", "--iterations", type=int, default=1,
-                        help="Number of self-improvement iterations to run (default: 1)")
+                        help="Number of iterations to run (default: 1)")
     args = parser.parse_args()
 
     client = create_client()
     protocol = load_protocol()
     agent_names = [f"Agent_{i}" for i in range(3)]
 
-    # Each run gets its own log file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = f"{LOG_DIR}/run_{timestamp}.jsonl"
 
-    # Back up the original protocol
     os.makedirs(LOG_DIR, exist_ok=True)
     shutil.copy("protocol.json", f"{LOG_DIR}/protocol_v0_{timestamp}.json")
 
@@ -960,7 +935,6 @@ def main():
     print(f"\n{'='*60}")
     print(f"All {args.iterations} iteration(s) complete.")
     print(f"Log: {log_file}")
-    print(f"Protocol evolved through {args.iterations} self-improvement cycle(s).")
 
     print_metrics_summary()
 

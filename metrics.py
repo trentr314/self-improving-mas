@@ -69,8 +69,8 @@ def print_metrics_summary():
     print("-" * 50)
     for m in log:
         print(f"{m['iteration']:>4}  "
-              f"{m.get('vote_consensus', m.get('meta_consensus', 0)):>14.3f}  "
-              f"{m.get('critique_length', m.get('critique_severity', 0)):>12.3f}  "
+              f"{m.get('vote_consensus', 0):>14.3f}  "
+              f"{m.get('critique_length', 0):>12.3f}  "
               f"{m.get('num_phases', 0):>6}  "
               f"{m.get('num_custom_phases', 0):>6}")
     print()
